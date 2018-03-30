@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+
+import pandas as pd
+
+from collections import ChainMap
+from glob import iglob
+from tabulate import tabulate
+
+
+def search_line(log, ex):
+    match = re.search(ex, log)
+    if match:
+        return match.groupdict()
+
+def search_sequential(loglist, exlist):
+    exes = exlist.copy()
+    logs = loglist.copy()
+    matches = []
+    while exes:
+        ex = exes.pop(0)
+        current, logs = search_regex(logs, ex)
+        matches.append(current)
+    return dict(ChainMap(*matches))
+
+def search_regex(loglist, ex):
+    temp = loglist.copy()
+    current = {}
+    while temp and not current:
+        line = temp.pop(0)
+        current = search_line(line, ex)
+    if not current:
+        return {}, loglist
+    return current, temp
+
+def memparse(s):
+    if type(s) is str:
+        key = {'KB': 0.001, 'MB': 1, 'GB': 1000}
+        number, suffix = s.split(' ')
+        return(float(number) * key[suffix])
+    else:
+        return s
+
+def getcores(s):
+    if '*' in s:
+        return int(s.split('*')[0])
+    return 1
+
+def getpath():
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+    else:
+        path = '.'
+    return os.path.normpath(path)
+
+def read_logs(exes):
+    rows = []
+    for f in iglob(getpath() + '/*.stdout'):
+        with open(f, 'r') as l:
+            log = [line for line in l]
+        row = search_sequential(log, exes)
+        row = {**row, 'rule': f.split(':')[0].split('/')[-1]}
+        rows.append(row)
+
+    b = pd.DataFrame(rows).set_index('JobID')
+
+    b.end = pd.to_datetime(b.end)
+    b.start = pd.to_datetime(b.start)
+    b.avg_mem = b.avg_mem.apply(memparse)
+    b.tot_mem = b.tot_mem.apply(memparse)
+    b.max_mem = b.max_mem.apply(memparse)
+    b.max_thread = b.max_thread.astype(int)
+    b['cores'] = b.host.apply(getcores)
+    b['spare_mem'] = b.tot_mem - b.max_mem
+    b['duration'] = b.end - b.start
+
+    return b
+
+#list of whole-line regex matches with named capture groups
+print("Analyzing LSF log files...\n\n")
+
+exes = [r'Subject: Job (?P<JobID>\d+)',
+        r'Job was executed on host\(s\) <(?P<host>.+)>, in queue <(?P<queue>.+)>, as',
+        r'Started at (?P<start>.+)', r'Results reported on (?P<end>.+)',
+        r'Exited with exit code (?P<exit_code>\d+)',
+        r'CPU time :\s+(?P<cpu_time>[0-9.]+)',
+        r'Max Memory :\s+(?P<max_mem>.+)',
+        r'Average Memory :\s+(?P<avg_mem>.+)',
+        r'Total Requested Memory :\s+(?P<tot_mem>.+)',
+        r'Max Processes :\s+(?P<max_proc>.+)',
+        r'Max Threads :\s+(?P<max_thread>.+)']
+
+all_list = ['start','duration','max_mem','spare_mem','max_thread','cores',
+            'rule','queue','host','exit_code']
+
+most_list = ['rule','duration','max_mem','spare_mem','max_thread','cores',
+             'host','exit_code']
+
+df_raw = read_logs(exes)
+
+alls = df_raw[all_list]
+most = df_raw[most_list]
+exits = most[alls['exit_code'].notnull()]
+grouped = most.groupby('rule')
+
+if not exits.empty:
+    print("""
+Some errors occured. Details are below.
+    """)
+    print(tabulate(exits, headers = [
+        'Job ID', 'Rule', 'Duration', 'Max (MB)',
+        'Spare (MB)', 'Thrd', 'Core', 'Host', 'Code'],
+        tablefmt = 'fancy_grid'))
+
+print("""
+The minimum (remaining memory) or maximum of key performance measures are provided
+below. Cores and Threads should be roughly equal unless thread counts are variable.
+Spare memory should be kept as low as safe.
+""")
+
+df1 = pd.DataFrame(grouped['spare_mem'].min()).join(
+    grouped['max_mem', 'max_thread', 'cores'].max()).astype(int).join(
+    grouped['duration'].max())[
+    ['duration', 'max_mem', 'spare_mem', 'max_thread', 'cores']]
+
+print(tabulate(df1, headers = [
+    'Rule', 'Max Duration', 'Max (MB)',
+    'Min Spare (MB)', 'Max Thrd', 'Max Cores'],
+    tablefmt = 'fancy_grid'))
+
+print("""
+The means of key performance measures are probided below.
+""")
+
+avg = grouped['max_mem', 'spare_mem', 'max_thread',
+              'cores', 'duration'].mean().astype(int)
+
+avg_time = pd.to_timedelta(pd.DataFrame(most.rule).
+               join(most.duration.astype(int)).
+               groupby('rule').mean().duration, unit='ns')
+
+avg = pd.DataFrame(avg_time).join(avg)
+
+print(tabulate(avg, headers = [
+    'Rule', 'Max Duration', 'Max (MB)',
+    'Spare (MB)', 'Threads', 'Cores'],
+    tablefmt = 'fancy_grid') + "\n\n")
